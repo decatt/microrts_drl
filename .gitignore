@@ -1,0 +1,8 @@
+/model
+/runs
+/_pycache__
+/__pycache__/graph_attention_model.cpython-39.pyc
+/__pycache__/utils.cpython-39.pyc
+/wandb
+/saved_model
+/.vscode
