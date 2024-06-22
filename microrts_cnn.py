@@ -1,17 +1,17 @@
-import sys,os,time
+import sys,os
 sys.path.append(os.path.abspath(os.path.dirname(__file__) + '/' + '..'))
-
-import torch 
-import torch.nn as nn
+import torch
 from gym_microrts.envs.vec_env import MicroRTSVecEnv
 from gym_microrts import microrts_ai
 from collections import deque
 import numpy as np
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
+from nets import CNNNet as ActorCritic
+from utils import calculate_gae, remake_mask
+import torch.nn as nn
+import wandb
+import random
 import argparse
-
-from utils import layer_init, calculate_gae, MaskedCategorical
 
 lr = 2.5e-4
 gamma = 0.99
@@ -21,74 +21,28 @@ max_clip_range = 4
 ent_coef = 0.01
 vf_coef = 0.5
 max_grad_norm = 0.5
-seed = 1
-num_envs = 8
-num_steps = 512
-action_space = [256, 6, 4, 4, 4, 4, 7, 49]
-observation_space = [16,16,27]
 cuda = True
 device = 'cuda'
-pae_length = 128
-map_path = 'maps/16x16/basesWorkers16x16.xml'
+pae_length = 256
+num_envs = 32
+num_steps = 512
 
+ai_dict = {
+    "coacAI": microrts_ai.coacAI,
+    "rojo": microrts_ai.rojo,
+    "mayari": microrts_ai.mayari,
+    "randomAI": microrts_ai.randomAI,
+    "passiveAI": microrts_ai.passiveAI,
+    "workerRushAI": microrts_ai.workerRushAI,
+    "lightRushAI": microrts_ai.lightRushAI,
+}
 
-#main network
-class ActorCritic(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.policy_network = nn.Sequential(
-            layer_init(nn.Conv2d(27, 16, kernel_size=(3, 3), stride=(2, 2))),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(16, 32, kernel_size=(2, 2))),
-            nn.ReLU(),
-            nn.Flatten(),
-            layer_init(nn.Linear(32*6*6, 256)),
-            nn.ReLU(),
-        )
+parser = argparse.ArgumentParser(description='PPO')
+parser.add_argument('--map_name', type=str, default='TwoBasesBarracks16x16')
+parser.add_argument('--op_ai', type=str, default='coacAI')
+args = parser.parse_args()
 
-        self.policy_unit = layer_init(nn.Linear(256, 256), std=0.01)
-        self.policy_type = layer_init(nn.Linear(256, 6), std=0.01)
-        self.policy_move = layer_init(nn.Linear(256, 4), std=0.01)
-        self.policy_harvest = layer_init(nn.Linear(256, 4), std=0.01)
-        self.policy_return = layer_init(nn.Linear(256, 4), std=0.01)
-        self.policy_produce = layer_init(nn.Linear(256, 4), std=0.01)
-        self.policy_produce_type = layer_init(nn.Linear(256, 7), std=0.01)
-        self.policy_attack = layer_init(nn.Linear(256, 49), std=0.01)
-        
-        self.value = nn.Sequential(
-                layer_init(nn.Conv2d(27, 16, kernel_size=(3, 3), stride=(2, 2))),
-                nn.ReLU(),
-                layer_init(nn.Conv2d(16, 32, kernel_size=(2, 2))),
-                nn.ReLU(),
-                nn.Flatten(),
-                layer_init(nn.Linear(32*6*6, 256)),
-                nn.ReLU(), 
-                layer_init(nn.Linear(256, 1), std=1)
-            )
-        
-    def get_distris(self,states):
-        states = states.permute((0, 3, 1, 2))
-        policy_network = self.policy_network(states)
-        unit_distris = MaskedCategorical(self.policy_unit(policy_network))
-        type_distris = MaskedCategorical(self.policy_type(policy_network))
-        move_distris = MaskedCategorical(self.policy_move(policy_network))
-        harvest_distris = MaskedCategorical(self.policy_harvest(policy_network))
-        return_distris = MaskedCategorical(self.policy_return(policy_network))
-        produce_distris = MaskedCategorical(self.policy_produce(policy_network))
-        produce_type_distris = MaskedCategorical(self.policy_produce_type(policy_network))
-        attack_distris = MaskedCategorical(self.policy_attack(policy_network))
-
-        return [unit_distris,type_distris,move_distris,harvest_distris,return_distris,produce_distris,produce_type_distris,attack_distris]
-
-    def get_value(self, states):
-        states = states.permute((0, 3, 1, 2))
-        value = self.value(states)
-        return value
-    
-    def forward(self, states):
-        distris = self.get_distris(states)
-        value = self.get_value(states)
-        return distris,value
+op_ai = ai_dict[args.op_ai]
 
 class Agent:
     def __init__(self,net:ActorCritic) -> None:
@@ -101,7 +55,7 @@ class Agent:
         self.env = MicroRTSVecEnv(
                 num_envs=self.num_envs,
                 max_steps=5000,
-                ai2s=[microrts_ai.coacAI for _ in range(self.num_envs)],
+                ai2s=[op_ai for _ in range(self.num_envs)],
                 map_path=map_path,
                 reward_weight=np.array([10.0, 1.0, 1.0, 0.2, 1.0, 4.0])
             )
@@ -120,6 +74,7 @@ class Agent:
         action_components = [units]
 
         action_mask_list = np.array(self.env.vec_client.getUnitActionMasks(units.cpu().numpy())).reshape(len(units), -1)
+        action_mask_list = remake_mask(action_mask_list)
         action_masks = torch.split(torch.Tensor(action_mask_list), self.action_space[1:], dim=1) 
         
         action_components +=  [dist.update_masks(action_mask).sample() for dist , action_mask in zip(distris[1:],action_masks)]
@@ -185,7 +140,7 @@ class Calculator:
         else:
             self.device = torch.device('cpu')
         
-        self.calculate_net = ActorCritic()
+        self.calculate_net = ActorCritic(cnn_output_dim=cnn_output_dim,pos_output=action_space[0])
         self.calculate_net.to(self.device)
     
         self.share_optim = torch.optim.Adam(params=self.net.parameters(), lr=lr)
@@ -322,40 +277,84 @@ class Calculator:
             self.share_optim.step()
 
 if __name__ == "__main__":
-    for i in range(10):
-        writer = SummaryWriter()
+    map_name = args.map_name
+    if map_name == "basesWorkers16x16noResources":
+        map_path = "maps/16x16/basesWorkers16x16NoResources.xml"
+        h=16
+        w=16
+        cnn_output_dim = 32*6*6
+    elif map_name == "basesWorkers12x12":
+        map_path = "maps/12x12/basesWorkers12x12.xml"
+        h=12
+        w=12
+        cnn_output_dim = 32*4*4
+    elif map_name == "TwoBasesBarracks16x16":
+        map_path = "maps/16x16/TwoBasesBarracks16x16.xml"
+        h=16
+        w=16
+        cnn_output_dim = 32*6*6
+    action_space = [w*h, 6, 4, 4, 4, 4, 7, 49]
+    observation_space = [w,h,27]
 
-        net = ActorCritic()
-        parameters = sum([np.prod(p.shape) for p in net.parameters()])
-        print("parameters size is:",parameters)
+    comment = "ppo_"+map_name
 
-        agent = Agent(net)
-        calculator = Calculator(net)
+    seed = random.randint(0,100000)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
-        MAX_VERSION = 4000
-        REPEAT_TIMES = 10
+    net = ActorCritic(cnn_output_dim=cnn_output_dim,pos_output=action_space[0])
+    net.load_state_dict(torch.load("saved_model\ppo_agent\ppo_basesWorkers16x16noResources.pt"))
+    parameters = sum([np.prod(p.shape) for p in net.parameters()])
+    print("parameters size is:",parameters)
 
-        for version in range(MAX_VERSION):
-            samples_list,infos = agent.sample_env(check=True)
+    agent = Agent(net)
+    calculator = Calculator(net)
 
-            for (key,value) in infos.items():
-                writer.add_scalar(key,value,version)
+    MAX_VERSION = 5000
+    REPEAT_TIMES = 10
 
-            print("version:",version,"reward:",infos["mean_rewards"])
+    wandb.init(
+        # set the wandb project where this run will be logged
+        project='microrts_ppo',
+        name = comment+str(seed),
+        group = comment,
 
-            samples = []
+        # track hyperparameters and run metadata
+        config={
+        "base_ai":"none",
+        "op_ai": args.op_ai,
+        "map": map_name,
+        "epochs": MAX_VERSION,
+        "samples_per_epochs":num_envs*pae_length,
+        "start_win_rate":0,
+        "temperature_coefficient":-2,
+        }
+    )
+    for _ in range(20):
+        agent.sample_env(check=True)
+        print("checking...")
 
-            for s in samples_list:
-                samples.append(s)
-            
-            calculator.begin_batch_train(samples)
-            for _ in range(REPEAT_TIMES):
-                calculator.generate_grads()
-            calculator.end_batch_train()
+    for version in range(MAX_VERSION):
+        samples_list,infos = agent.sample_env(check=True)
 
-            if version % 100 == 0:
-                torch.save(net.state_dict(), "model/ppo_model_"+str(version)+"_"+str(i)+".pth")
-                torch.save(net, "model/ppo_model_"+str(version)+"_"+str(i)+".pkl")
-        writer.close()            
+        infos["global_steps"] = version*num_envs*pae_length
+        wandb.log(infos)
 
+        print("version:",version,"reward:",infos["mean_rewards"])
+        win_rate = infos["mean_win_rates"]
+
+        samples = []
+
+        for s in samples_list:
+            samples.append(s)
+        
+        calculator.begin_batch_train(samples)
+        for _ in range(REPEAT_TIMES):
+            calculator.generate_grads()
+        calculator.end_batch_train()
+
+    torch.save(net.state_dict(), "saved_model/ppo_agent/"+comment+str(seed)+".pt")
+        
+    wandb.finish()
 

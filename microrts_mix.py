@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from utils import layer_init, calculate_gae, remake_mask,MaskedCategorical
 import random
 import argparse
+from state_data_process import process_states, extract_centered_regions
 
 lr = 2.5e-4
 gamma = 0.99
@@ -21,7 +22,7 @@ ent_coef = 0.01
 vf_coef = 0.5
 max_grad_norm = 0.5
 seed = 1
-num_envs = 16
+num_envs = 32
 num_steps = 512
 num_closest = 16
 
@@ -64,65 +65,6 @@ elif map_name == 'basesWorkers8x8':
 action_space = [h*w, 6, 4, 4, 4, 4, 7, 49]
 observation_space = [h,w,27]
 
-
-def pad_tensor(tensor, padding):
-    # Pads a 4D tensor along the height and width dimensions
-    batch_size, h, w, _ = tensor.shape
-    tensor_padded = torch.zeros((batch_size, h + 2*padding, w + 2*padding, 27))
-    tensor_padded[:, padding:-padding, padding:-padding, :] = tensor
-    return tensor_padded
-
-def extract_centered_regions(tensor, points):
-    # Assumption: kernel_size is odd
-    padding = kernel_size // 2
-    tensor_padded = pad_tensor(tensor, padding)
-
-    batch_size, tensor_height, tensor_width, _ = tensor.shape
-    output_tensor = torch.zeros((batch_size, kernel_size, kernel_size, 27))
-
-    for batch_index in range(batch_size):
-        pos = points[batch_index]
-        if pos >=0:
-            padded_x = pos // tensor_width + padding
-            padded_y = pos % tensor_width + padding
-            output_tensor[batch_index] = tensor_padded[batch_index, padded_x-padding:padded_x+padding+1, padded_y-padding:padded_y+padding+1, :]
-        else:
-            output_tensor[batch_index] = torch.zeros((kernel_size, kernel_size, 27))
-
-    return output_tensor
-
-def process_states(states, selected_units):
-    states = torch.tensor(states)
-    pv_state = extract_centered_regions(states, selected_units)
-    nodes_features = []
-    for i in range(num_envs):
-        state = states[i]
-        selected_unit = selected_units[i]
-        if selected_unit == -1:
-            nodes_features.append(torch.zeros((num_closest,29)))
-        else:
-            selected_unit_x = selected_unit//w
-            selected_unit_y = selected_unit%w
-            nodes_feature = []
-            for y_pos in range(w):
-                for x_pos in range(h):
-                    if x_pos>=16 or y_pos>=16:
-                        print(x_pos,y_pos)
-                    if state[y_pos][x_pos][13] != 1:
-                        d = abs(selected_unit_x-x_pos)+abs(selected_unit_y-y_pos)
-                        if d >0:
-                            nodes_feature.append((d,torch.cat((torch.tensor([x_pos/w,y_pos/h]),state[y_pos][x_pos]))))
-                        elif d == 0:
-                            nodes_feature.append((0,torch.cat((torch.tensor([x_pos/w,y_pos/h]),state[y_pos][x_pos]))))
-            #sort by distance and get the first 8
-            if len(nodes_feature) > num_closest:
-                nodes_feature.sort(key=lambda x:x[0])
-                nodes_feature = nodes_feature[:num_closest]
-            else:
-                for _ in range(num_closest-len(nodes_feature)):
-                    nodes_feature.append((-1,torch.zeros(29)))
-            nodes_features.append(torch.stack([x[1] for x in nodes_feature]))
-    return pv_state, torch.stack(nodes_features)
 
 #main network
 class ActorCritic(nn.Module):
@@ -225,7 +167,7 @@ class Agent:
            rewards = []
            log_probs = [] 
         while len(self.exps_list[0]) < self.num_steps:
-            self.env.render()
+            #self.env.render()
             unit_masks = np.array(self.env.vec_client.getUnitLocationMasks()).reshape(self.num_envs, -1)
             #randomly sample units from unit_mask where the value is 1 return the index of the unit
             unit_list = []
@@ -234,10 +176,16 @@ class Agent:
                     unit_list.append(-1)
                 else:
                     unit_list.append(np.random.choice(np.where(unit_mask == 1)[0]))
-            
-            cnn_states,linears_states = process_states(self.obs, unit_list)
-            action,mask,log_prob=self.get_sample_actions(cnn_states,linears_states,unit_list)
-            action = action.astype(np.int32)
+            try:
+                cnn_states = extract_centered_regions(self.obs, unit_list, kernel_size)
+                linears_states = process_states(self.obs, unit_list, num_closest)
+                action,mask,log_prob=self.get_sample_actions(cnn_states,linears_states,unit_list)
+                action = action.astype(np.int32)
+            except Exception as e:
+                print(e)
+                action = np.zeros((self.num_envs,8),dtype=np.int32)
+                mask = np.zeros((self.num_envs,78),dtype=np.int32)
+                log_prob = np.zeros((self.num_envs,7),dtype=np.float32)
             next_obs, rs, done_n, infos = self.env.step(action)
         
             if check:
@@ -438,7 +386,7 @@ if __name__ == "__main__":
     np.random.seed(seed)
     random.seed(seed)
 
-    commemt = "mix_v"+str(seed)
+    commemt = "mix_"+str(seed)
 
     MAX_VERSION = 5001
     REPEAT_TIMES = 10
@@ -491,5 +439,6 @@ if __name__ == "__main__":
             calculator.end_batch_train()
         print("time:",time.time()-strat_time)
 
-    torch.save(net.state_dict(), "model/ppo_model_"+commemt+".pkl")
-    torch.save(net, "model/ppo_model_"+commemt+".pth")
+        if version % 500 == 0 and version > 0:
+            torch.save(net.state_dict(), "model/ppo_model_"+commemt+".pkl")
+            torch.save(net, "model/ppo_model_"+commemt+".pth")

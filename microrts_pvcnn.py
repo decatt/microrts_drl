@@ -29,10 +29,10 @@ num_closest = 8
 cuda = True
 device = 'cuda'
 pae_length = 256
-kernel_size = 7
+kernel_size = 9
 
 
-map_name = 'TwoBasesWorkers12x12'
+map_name = 'basesWorkers16x16'
 if map_name == 'TwoBasesWorkers12x12':
     h=12
     w=12
@@ -92,7 +92,7 @@ class ActorCritic(nn.Module):
             layer_init(nn.Conv2d(16, 32, kernel_size=(2, 2))),
             nn.ReLU(),
             nn.Flatten(),
-            layer_init(nn.Linear(32*2*2, 256)),
+            layer_init(nn.Linear(32*3*3, 256)),
             nn.ReLU(),
         )
 
@@ -110,7 +110,7 @@ class ActorCritic(nn.Module):
                 layer_init(nn.Conv2d(16, 32, kernel_size=(2, 2))),
                 nn.ReLU(),
                 nn.Flatten(),
-                layer_init(nn.Linear(32*2*2, 256)),
+                layer_init(nn.Linear(32*3*3, 256)),
                 nn.ReLU(),
                 layer_init(nn.Linear(256, 1), std=1)
             )
@@ -404,7 +404,7 @@ if __name__ == "__main__":
         for version in range(MAX_VERSION):
             strat_time = time.time()
             samples_list,infos = agent.sample_env(check=True)
-            samples_list = data_argument(samples_list)
+            #samples_list = data_argument(samples_list)
 
             for (key,value) in infos.items():
                 writer.add_scalar(key,value,version)
